@@ -519,6 +519,24 @@ describe("loadEffectiveConfig", () => {
 		rmSync(cwd, { recursive: true, force: true });
 	});
 
+	test("F4b: global strictModel=true is a floor the project cannot loosen; invalid type fails closed", () => {
+		writeFile(tmpHome, "next-prompt.json", JSON.stringify({ strictModel: true }));
+		const cwd = mkdtempSync(join(tmpdir(), "np-cwd-"));
+		writeFile(
+			cwd,
+			".pi/next-prompt.json",
+			JSON.stringify({ strictModel: false }),
+		);
+		expect(loadEffectiveConfig(cwd).strictModel).toBe(true);
+		writeFile(
+			cwd,
+			".pi/next-prompt.json",
+			JSON.stringify({ strictModel: "yes" }),
+		);
+		expect(loadEffectiveConfig(cwd).computeDisabled).toBe(true);
+		rmSync(cwd, { recursive: true, force: true });
+	});
+
 	test("F5: project may reduce the transcript cap", () => {
 		writeFile(
 			tmpHome,
@@ -748,6 +766,49 @@ describe("resolveSuggestionModel", () => {
 		// F-10: fallback is announced once instead of staying silent.
 		expect(notifies).toHaveLength(1);
 		expect(notifies[0]).toContain("different destination");
+	});
+
+	test("T14s: strictModel blocks both fallbacks to the active model (warns once)", () => {
+		const active = { provider: "openai", id: "gpt" };
+		const claude = { provider: "anthropic", id: "claude" };
+		const notifies: string[] = [];
+		const ctx = makeCtx({
+			model: active,
+			notify: (m) => notifies.push(m),
+			findModel: (p, m) =>
+				p === "anthropic" && m === "claude" ? claude : undefined,
+		});
+		const missing: NextPromptConfig = {
+			model: { provider: "anthropic", model: "missing" },
+			strictModel: true,
+		};
+		const ref = { value: false };
+		expect(resolveSuggestionModel(ctx, missing, ref)).toEqual({
+			model: undefined,
+			crossDestination: false,
+		});
+		expect(resolveSuggestionModel(ctx, missing, ref).model).toBeUndefined();
+		expect(notifies).toHaveLength(1);
+		expect(notifies[0]).toContain("strictModel");
+
+		const cross: NextPromptConfig = {
+			model: { provider: "anthropic", model: "claude" },
+			allowCrossProvider: false,
+			strictModel: true,
+		};
+		expect(resolveSuggestionModel(ctx, cross, { value: false })).toEqual({
+			model: undefined,
+			crossDestination: false,
+		});
+		// strictModel never blocks the configured model itself: with
+		// allowCrossProvider it still goes through the consent path.
+		expect(
+			resolveSuggestionModel(
+				ctx,
+				{ ...cross, allowCrossProvider: true },
+				{ value: false },
+			),
+		).toEqual({ model: claude, crossDestination: true });
 	});
 
 	test("T15: allowCrossProvider=false + same destination returns configured model", () => {
@@ -4843,6 +4904,7 @@ describe("configureInteractively", () => {
 			maxRecentTurns: "",
 			maxSuggestionChars: "320",
 			allowCrossProvider: false,
+			strictModel: false,
 		};
 		const onCtx = makeConfigCtx({ answers: { ...base, debug: true } });
 		expect((await configureInteractively(onCtx, {}))?.debug).toBe(true);
@@ -4850,6 +4912,26 @@ describe("configureInteractively", () => {
 		const offCtx = makeConfigCtx({ answers: { ...base, debug: false } });
 		const off = await configureInteractively(offCtx, { debug: true });
 		expect(off?.debug).toBeUndefined();
+	});
+
+	test("T119f: strictModel yes → saved true; no over a saved true → saved false", async () => {
+		const base = {
+			model: "(use current model)",
+			renderMode: "widget — colored line below the input box",
+			thinking: "(unset — model default)",
+			acceptKey: "alt+/",
+			rearmDelayMs: "2000",
+			maxTranscriptChars: "12000",
+			maxRecentTurns: "",
+			maxSuggestionChars: "320",
+			allowCrossProvider: false,
+		};
+		const onCtx = makeConfigCtx({ answers: { ...base, strictModel: true } });
+		expect((await configureInteractively(onCtx, {}))?.strictModel).toBe(true);
+
+		const offCtx = makeConfigCtx({ answers: { ...base, strictModel: false } });
+		const off = await configureInteractively(offCtx, { strictModel: true });
+		expect(off?.strictModel).toBe(false);
 	});
 
 	test("T120: cancel at model picker → undefined", async () => {
@@ -5013,6 +5095,7 @@ test("T124b: outside the TUI each choice lists its current value first", async (
 		renderMode: "both",
 		thinking: "high",
 		allowCrossProvider: true,
+		strictModel: true,
 		debug: true,
 		autoTrigger: false,
 	});
@@ -5021,6 +5104,7 @@ test("T124b: outside the TUI each choice lists its current value first", async (
 		"both — inline ghost AND the below-editor line",
 		"high",
 		"yes — use the configured model even on a different provider (per-project consent)",
+		"yes — suggest nothing when the configured model is missing or blocked",
 		"yes — labels and sizes only, never transcript or suggestion text",
 		"no — manual only: press the accept key to generate, again to accept",
 	]);
@@ -5032,6 +5116,7 @@ test("T124c: pressing Enter through every TUI dialog keeps the settings", async 
 		renderMode: "both" as const,
 		thinking: "high" as const,
 		allowCrossProvider: true,
+		strictModel: true,
 		debug: true,
 		autoTrigger: false,
 	};

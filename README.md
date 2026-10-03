@@ -153,7 +153,7 @@ Run the `/next-prompt-config` slash command for a guided walkthrough of
 a model picker over all available models (type to search; the list scrolls inside
 a window sized to the terminal), render mode, thinking level, accept
 key, re-arm delay, transcript/recent-turn/suggestion caps, cross-provider
-disclosure, the diagnostic log, and auto-trigger. Every choice opens on its
+disclosure, strict model (no fallback), the diagnostic log, and auto-trigger. Every choice opens on its
 saved value and an empty answer keeps it, so pressing Enter through the whole
 walkthrough changes nothing (the recent-turn cap is removed by typing `all`).
 Changes are saved to the host agent dir
@@ -182,13 +182,14 @@ comes from the host's `CONFIG_DIR_NAME`:
   "maxTranscriptChars": 12000,
   "maxRecentTurns": 10,
   "maxSuggestionChars": 240,
-  "allowCrossProvider": false
+  "allowCrossProvider": false,
+  "strictModel": false
 }
 ```
 
 | Field | Default | Notes |
 | --- | --- | --- |
-| `model` | current model (`ctx.model`) | `{ provider, model, sessionId? }`. If the configured model isn't found, pi notifies once (`warning`) and falls back to the current model. For `opencode`/`opencode-go` the wizard also stores a `sessionId`, sent as the `x-opencode-session` header that gateway requires (it answers `400 MissingSessionID` without one); it is minted once per model and reused, so suggestions keep a stable route across sessions. Other providers ignore it. |
+| `model` | current model (`ctx.model`) | `{ provider, model, sessionId? }`. If the configured model isn't found, pi notifies once (`warning`) and falls back to the current model (or computes nothing with `strictModel: true`). For `opencode`/`opencode-go` the wizard also stores a `sessionId`, sent as the `x-opencode-session` header that gateway requires (it answers `400 MissingSessionID` without one); it is minted once per model and reused, so suggestions keep a stable route across sessions. Other providers ignore it. |
 | `thinking` | unset | Reasoning level for the suggestion model: `"minimal"`/`"low"`/`"medium"`/`"high"`/`"xhigh"`/`"max"`. Set `"low"` for faster suggestions. Passed as `reasoning` to the model call. |
 | `acceptKey` | `"alt+/"` | Any pi-tui `KeyId` (e.g. `"alt+/"`, `"ctrl+space"`, `"shift+enter"`). Intercepted **before** the base editor, so keys like `ctrl+space` (`\x00`) won't pollute the box. Accept only fires when a suggestion is showing and the autocomplete dropdown is closed. |
 | `autoTrigger` | `true` | When `true` (default), suggestions are computed automatically after every settled turn. When `false`, manual-only: the accept key doubles as the manual trigger (first press generates, second press accepts, in-flight press is a no-op). |
@@ -198,9 +199,10 @@ comes from the host's `CONFIG_DIR_NAME`:
 | `maxTranscriptChars` | `12000` | Tail-truncation of the conversation transcript sent to the model. |
 | `maxRecentTurns` | all | Disclosure minimization: only the last N user/assistant turns are sent (tool results are never sent regardless). Invalid values fail closed — suggestions are disabled. |
 | `maxSuggestionChars` | `240` | Cap on the returned suggestion length (visible width; a hard code-point bound of 4× this value also applies, so zero-width payloads cannot bypass the cap). |
-| `allowCrossProvider` | `false` | When `true`, a configured suggestion model on a **different destination** (provider + endpoint + model route) than the active model may be used — but only after explicit per-project consent (see Security). When `false`, fall back to the active model silently. Project config can never loosen a global `false`. |
+| `allowCrossProvider` | `false` | When `true`, a configured suggestion model on a **different destination** (provider + endpoint + model route) than the active model may be used — but only after explicit per-project consent (see Security). When `false`, fall back to the active model with a one-time warning (or compute nothing with `strictModel`). Project config can never loosen a global `false`. |
+| `strictModel` | `false` | When `true`, the configured `model` is mandatory: if it is missing from the registry, or on a different destination while `allowCrossProvider` is `false`, no suggestion is computed (one warning per session) instead of falling back to the active model. No effect when no `model` is configured. Project config can tighten to `true` but never loosen a global `true`; a non-boolean value disables suggestions. Set by the "require the configured model" step of `/next-prompt-config`. |
 | `allowCrossProviderPairs` | `[]` | Directional provider pairs that skip the consent dialog: `[["activeProvider", "suggestionProvider"]]` (e.g. `[["opencode-go", "openai"]]`). Set via the dialog's "Always allow for this provider pair" option (saved to the global config) or by hand. Case-insensitive; the reverse direction is NOT implied. Invalid entries fail closed — suggestions are disabled. |
-| `debug` | `false` (absent) | When `true`, appends one JSON line per decision to `<agent dir>/next-prompt-debug.log`: event name, model, transcript/response **sizes**, stop reason, token counts — never transcript or suggestion text. Absent or `false` means no file is written at all. Toggled by the last step of `/next-prompt-config`. |
+| `debug` | `false` (absent) | When `true`, appends one JSON line per decision to `<agent dir>/next-prompt-debug.log`: event name, model, transcript/response **sizes**, stop reason, token counts — never transcript or suggestion text. Absent or `false` means no file is written at all. Toggled by the diagnostic-log step of `/next-prompt-config`. |
 
 ### Why `alt+/` is the default accept key
 
@@ -227,8 +229,9 @@ data-handling terms.
 Cross-destination disclosure is **opt-in and fail-closed**:
 
 - `allowCrossProvider` defaults to `false`. With `false`, a configured model on a
-different destination is never used; the extension silently falls back to the
-active model (and, when there is no active model, computes nothing).
+different destination is never used; the extension falls back to the active model
+with a one-time warning (and, when there is no active model, computes nothing).
+Set `strictModel: true` to compute nothing instead of falling back.
 - With `true`, the first time a different destination would receive the transcript,
 the host shows a dialog naming the destination and the transcript size, with three
 choices: **Allow once (this project)**, **Always allow for this provider pair**, and

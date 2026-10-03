@@ -175,6 +175,15 @@ export interface NextPromptConfig {
 	 * invalidate a pair grant.
 	 */
 	allowCrossProviderPairs?: Array<[string, string]>;
+	/**
+	 * Whether the configured suggestion model is mandatory. Defaults to FALSE:
+	 * when the configured model is missing from the registry or is on a
+	 * different destination without `allowCrossProvider`, fall back to the
+	 * active model. When true, those cases compute nothing (warned once per
+	 * session) instead of silently switching models. No effect when no model
+	 * is configured.
+	 */
+	strictModel?: boolean;
 	/** Delay (ms) before re-arming the last suggestion after the user deletes back to empty. Default 2000. */
 	rearmDelayMs?: number;
 	/**
@@ -197,6 +206,8 @@ export interface EffectiveConfig extends NextPromptConfig {
 	allowCrossProvider: boolean;
 	/** Resolved effective boolean (never undefined). */
 	autoTrigger: boolean;
+	/** Resolved effective boolean (never undefined). */
+	strictModel: boolean;
 	/** Whether project config was trusted and therefore applied. */
 	projectTrusted: boolean;
 	/** True when invalid privacy-bearing fields caused compute to be disabled. */
@@ -222,6 +233,7 @@ export interface ConsentRecord {
 }
 
 export const DEFAULT_ALLOW_CROSS_PROVIDER = false;
+export const DEFAULT_STRICT_MODEL = false;
 
 export type TriggerDecision = "compute" | "skip";
 
@@ -398,11 +410,15 @@ export function loadConfigDetailed(
 	//  - allowCrossProviderPairs: GLOBAL-ONLY. A project file must never be
 	//    able to silently authorize a new destination (Step 4 acceptance).
 	//  - allowCrossProvider: project may tighten to false, never loosen a global false.
+	//  - strictModel: project may tighten to true, never loosen a global true.
 	//  - maxTranscriptChars: project may reduce, never increase a global cap.
 	const merged: NextPromptConfig = { ...globalCfg, ...projectCfg };
 	merged.allowCrossProviderPairs = globalCfg.allowCrossProviderPairs;
 	if (globalCfg.allowCrossProvider === false) {
 		merged.allowCrossProvider = false;
+	}
+	if (globalCfg.strictModel === true) {
+		merged.strictModel = true;
 	}
 	if (typeof globalCfg.maxTranscriptChars === "number") {
 		merged.maxTranscriptChars = Math.min(
@@ -500,6 +516,10 @@ function parseConfig(text: string): {
 			case "allowCrossProvider":
 				if (typeof value !== "boolean") failPrivacy("must be a boolean");
 				else cfg.allowCrossProvider = value;
+				break;
+			case "strictModel":
+				if (typeof value !== "boolean") failPrivacy("must be a boolean");
+				else cfg.strictModel = value;
 				break;
 			case "debug":
 				if (typeof value !== "boolean") failPrivacy("must be a boolean");
@@ -610,6 +630,7 @@ export function loadEffectiveConfig(
 		...cfg,
 		allowCrossProvider: cfg.allowCrossProvider ?? DEFAULT_ALLOW_CROSS_PROVIDER,
 		autoTrigger: cfg.autoTrigger ?? DEFAULT_AUTO_TRIGGER,
+		strictModel: cfg.strictModel ?? DEFAULT_STRICT_MODEL,
 		projectTrusted,
 		computeDisabled,
 	};
@@ -950,13 +971,15 @@ export interface ResolvedModel {
  * rules:
  *  - configured model on the same destination as active  → use it
  *  - configured model on a different destination and `allowCrossProvider`
- *    is false (the default)                             → active model, silent
+ *    is false (the default)                             → active model, warn once
  *  - configured model on a different destination and `allowCrossProvider`
  *    is true                                            → mark crossDestination;
  *    controller decides via consent
  *  - configured model missing from registry             → warn once, active
  *  - no active model and a different destination is requested
  *    (allowCrossProvider false)                         → no model (fail closed)
+ *  - `strictModel` true: every "active" fallback above becomes no model
+ *    (warn once) — the configured model is used or nothing is
  */
 export function resolveSuggestionModel(
 	ctx: SuggestionCtx,
@@ -968,18 +991,28 @@ export function resolveSuggestionModel(
 		return { model: active, crossDestination: false };
 	}
 
+	const configured = `${config.model.provider}/${config.model.model}`;
+	const strict = config.strictModel === true;
+	const warnOnce = (message: string) => {
+		if (notifiedRef.value) return;
+		notifiedRef.value = true;
+		ctx.ui.notify(message, "warning");
+	};
+
 	const found = ctx.modelRegistry.find(
 		config.model.provider,
 		config.model.model,
 	);
 	if (!found) {
-		if (!notifiedRef.value) {
-			notifiedRef.value = true;
-			ctx.ui.notify(
-				`next-prompt: configured model ${config.model.provider}/${config.model.model} not found, using current model (${active?.provider ?? "unknown"}/${active?.id ?? "unknown"})`,
-				"warning",
+		if (strict) {
+			warnOnce(
+				`next-prompt: configured model ${configured} not found; suggestions disabled (strictModel)`,
 			);
+			return { model: undefined, crossDestination: false };
 		}
+		warnOnce(
+			`next-prompt: configured model ${configured} not found, using current model (${active?.provider ?? "unknown"}/${active?.id ?? "unknown"})`,
+		);
 		return { model: active, crossDestination: false };
 	}
 
@@ -992,26 +1025,19 @@ export function resolveSuggestionModel(
 	// Different destination than the active model.
 	const crossAllowed = config.allowCrossProvider === true;
 	if (!crossAllowed) {
-		// Fail closed: no active model to fall back to and no permission → no call.
-		if (!active) {
-			if (!notifiedRef.value) {
-				notifiedRef.value = true;
-				ctx.ui.notify(
-					`next-prompt: configured model ${config.model.provider}/${config.model.model} is on a different destination than the active model; suggestions disabled`,
-					"warning",
-				);
-			}
+		// Fail closed: no active model to fall back to, no permission, or the
+		// user forbade falling back → no call.
+		if (!active || strict) {
+			warnOnce(
+				`next-prompt: configured model ${configured} is on a different destination than the active model; suggestions disabled${strict ? " (strictModel; set allowCrossProvider to use it)" : ""}`,
+			);
 			return { model: undefined, crossDestination: false };
 		}
 		// F-10: silent fallback hid model changes behind quality regressions.
 		// Warn once per session so the effective model is diagnosable.
-		if (!notifiedRef.value) {
-			notifiedRef.value = true;
-			ctx.ui.notify(
-				`next-prompt: using current model (${active.provider}/${active.id}); configured ${config.model.provider}/${config.model.model} is on a different destination (set allowCrossProvider or a matching provider pair)`,
-				"warning",
-			);
-		}
+		warnOnce(
+			`next-prompt: using current model (${active.provider}/${active.id}); configured ${configured} is on a different destination (set allowCrossProvider or a matching provider pair)`,
+		);
 		return { model: active, crossDestination: false };
 	}
 
@@ -3738,7 +3764,7 @@ export async function configureInteractively(
 			update.maxSuggestionChars = n;
 	}
 
-	// 9–11. Yes/no settings. A two-item picker rather than `ui.confirm`, which
+	// 9–12. Yes/no settings. A two-item picker rather than `ui.confirm`, which
 	// always opens on "Yes": pressing Enter would allow cross-provider
 	// disclosure and switch the log on. Each opens on its current value.
 	// Undefined means no change — a cancel, or the current value picked again —
@@ -3773,7 +3799,17 @@ export async function configureInteractively(
 	);
 	if (cross !== undefined) update.allowCrossProvider = cross;
 
-	// 10. debug (opt-in). Absent means off; declining clears a saved true so
+	// 10. strictModel: yes = the configured model or nothing, no = fall back
+	// to the current model when the configured one cannot be used.
+	const strictPick = await askYesNo(
+		"next-prompt: require the configured model (no fallback)?",
+		current.strictModel ?? DEFAULT_STRICT_MODEL,
+		"suggest nothing when the configured model is missing or blocked",
+		"fall back to the current model",
+	);
+	if (strictPick !== undefined) update.strictModel = strictPick;
+
+	// 11. debug (opt-in). Absent means off; declining clears a saved true so
 	// the file returns to the default.
 	const debugPick = await askYesNo(
 		"next-prompt: write the diagnostic log (next-prompt-debug.log)?",
@@ -3783,7 +3819,7 @@ export async function configureInteractively(
 	);
 	if (debugPick !== undefined) update.debug = debugPick ? true : undefined;
 
-	// 11. autoTrigger: no = manual-only (the accept key doubles as the manual
+	// 12. autoTrigger: no = manual-only (the accept key doubles as the manual
 	// trigger), yes = settle-triggered suggestions.
 	const autoPick = await askYesNo(
 		"next-prompt: auto-trigger after each turn?",
