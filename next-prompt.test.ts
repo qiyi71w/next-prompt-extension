@@ -1450,6 +1450,20 @@ describe("overlayGhost", () => {
 		expect(out[1]).toContain(`\x1b[2m${"x".repeat(pad)}`);
 		expect(plain(out[1]!)).toBe(cursorGlyph + "x".repeat(pad) + "─╯");
 	});
+	test("T60f: Pi >= 1.4 fake-cursor APC markers — ghost lands after the end marker", () => {
+		// Pi 1.4 wraps the drawn cursor in `\x1b_pi:fc\x07…\x1b_pi:/fc\x07`. The
+		// old fallback skipped only `\x1b_p`, split the APC string and left
+		// `i:fc` visible after the ghost.
+		const FC_START = "\x1b_pi:fc\x07";
+		const FC_END = "\x1b_pi:/fc\x07";
+		const text = "hi";
+		const line = text + CURSOR_MARKER + FC_START + " " + FC_END + " ".repeat(WIDTH - 3);
+		const out = overlayGhost(["─".repeat(WIDTH), line, "─".repeat(WIDTH)], "xyz", WIDTH);
+		expect(out[1]).toContain(`${CURSOR_MARKER}${FC_START} ${FC_END}\x1b[2mxyz\x1b[22m`);
+		expect(visibleWidth(out[1]!)).toBe(WIDTH);
+		const shown = out[1]!.replace(/\x1b_[^\x07]*\x07/g, "").replace(/\x1b\[[0-9;]*m/g, "");
+		expect(shown).toBe("hi xyz" + " ".repeat(WIDTH - 6));
+	});
 	test("T62: empty lines array returns []", () => {
 		expect(overlayGhost([], "sug", WIDTH)).toEqual([]);
 	});
