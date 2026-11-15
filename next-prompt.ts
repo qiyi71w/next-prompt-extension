@@ -249,9 +249,22 @@ export interface BranchEntry {
 		isError?: boolean;
 		/** compactionSummary / branchSummary message text. */
 		summary?: unknown;
+		/** OMP custom message (`role: "custom"`) fields. */
+		customType?: string;
+		details?: unknown;
+		attribution?: string;
+		/** Epoch ms. */
+		timestamp?: unknown;
 	};
 	/** compaction / branch_summary entry text (session format). */
 	summary?: unknown;
+	/** OMP `custom_message` session-entry fields. */
+	customType?: string;
+	content?: unknown;
+	details?: unknown;
+	attribution?: string;
+	/** ISO time of the session entry. */
+	timestamp?: unknown;
 }
 
 /** Minimal shape of ctx used by resolveSuggestionModel / buildTranscript. */
@@ -1104,6 +1117,31 @@ function joinAssistantText(content: unknown): string {
 	return parts.join("");
 }
 
+/**
+ * Text the user typed that OMP delivers as a user-attributed custom message.
+ * A `/skill:` invocation's content is the expanded skill body, so only the
+ * invocation itself (`/skill:<name> <args>`) is used; a collab guest prompt's
+ * content is the typed text.
+ */
+function userCustomText(m: {
+	customType?: string;
+	content?: unknown;
+	details?: unknown;
+	attribution?: string;
+}): string {
+	if (m.attribution !== "user") return "";
+	if (m.customType === "skill-prompt") {
+		const d = m.details;
+		if (!d || typeof d !== "object") return "";
+		const name = "name" in d && typeof d.name === "string" ? d.name : "";
+		if (!name) return "";
+		const args = "args" in d && typeof d.args === "string" ? d.args.trim() : "";
+		return args ? `/skill:${name} ${args}` : `/skill:${name}`;
+	}
+	if (m.customType === "collab-prompt") return extractText(m.content);
+	return "";
+}
+
 interface TranscriptSegment {
 	line: string;
 	/** True when this line begins a user-led exchange (F-11 windowing). */
@@ -1152,6 +1190,11 @@ export function buildTranscript(
 			addSummary(entry.summary);
 			continue;
 		}
+		if (entry.type === "custom_message") {
+			const t = userCustomText(entry);
+			if (t) segments.push({ line: `User: ${t}`, isExchangeStart: true });
+			continue;
+		}
 		if (entry.type !== "message" || !entry.message) continue;
 		const msg = entry.message;
 		const role = msg.role;
@@ -1174,9 +1217,13 @@ export function buildTranscript(
 			}
 		} else if (role === "compactionSummary" || role === "branchSummary") {
 			addSummary(msg.summary);
+		} else if (role === "custom") {
+			const t = userCustomText(msg);
+			if (t) segments.push({ line: `User: ${t}`, isExchangeStart: true });
 		}
-		// All other roles (thinking-only assistants, bashExecution, custom) are
-		// semantically empty for next-prompt prediction and contribute nothing.
+		// All other roles (thinking-only assistants, bashExecution, other
+		// custom messages) are semantically empty for next-prompt prediction
+		// and contribute nothing.
 	}
 
 	// F-11 (revised): maxRecentTurns counts user-led exchanges — a user
@@ -1227,19 +1274,41 @@ function toBranchEntry(message: unknown): BranchEntry {
 	return { type: "message", message: message as BranchEntry["message"] };
 }
 
+/** Epoch ms of an entry: the message timestamp, else the session-entry time. */
+function entryTime(entry: BranchEntry): number | undefined {
+	const t = entry.message?.timestamp ?? entry.timestamp;
+	const ms =
+		typeof t === "number" ? t : typeof t === "string" ? Date.parse(t) : Number.NaN;
+	return Number.isFinite(ms) ? ms : undefined;
+}
+
 /**
  * Normalized context source for one request. OMP's terminal `agent_end`
- * carries the authoritative completed-message snapshot (preferred, Q6).
- * Pi reads the compaction-aware effective context; the raw branch is the
- * last resort for hosts that expose neither.
+ * carries the authoritative completed-message snapshot of the finished run
+ * (preferred, Q6) but only that run, so the earlier conversation is prepended
+ * from the session: entries strictly older than the run's first message,
+ * which excludes anything the session already recorded for this run. Pi reads
+ * the compaction-aware effective context; the raw branch is the last resort
+ * for hosts that expose neither.
  */
 function sessionEntries(
 	ctx: HostCtx,
 	externalMessages?: unknown[],
 ): BranchEntry[] {
 	if (externalMessages && externalMessages.length > 0) {
-		return externalMessages.map(toBranchEntry);
+		const run = externalMessages.map(toBranchEntry);
+		const runStart = entryTime(run[0]!);
+		if (runStart === undefined) return run;
+		const history = storedSessionEntries(ctx).filter((entry) => {
+			const t = entryTime(entry);
+			return t !== undefined && t < runStart;
+		});
+		return [...history, ...run];
 	}
+	return storedSessionEntries(ctx);
+}
+
+function storedSessionEntries(ctx: HostCtx): BranchEntry[] {
 	if (typeof ctx.sessionManager.buildSessionContext === "function") {
 		try {
 			const messages = ctx.sessionManager.buildSessionContext().messages;

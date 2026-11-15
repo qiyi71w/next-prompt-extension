@@ -216,7 +216,9 @@ Override with any `KeyId`, e.g. `"acceptKey": "ctrl+space"`.
 ## Security: cross-provider transcript disclosure
 
 The extension sends the conversation transcript (user + assistant text only — tool
-results, thinking blocks, and tool-call arguments are skipped) to the suggestion
+results, thinking blocks, and tool-call arguments are skipped; a user-invoked
+`/skill:` prompt contributes only its invocation line, `/skill:<name> <args>`, never
+the expanded skill body) to the suggestion
 model. This is **no more** than what the active model already saw **if** the
 suggestion model is on the **same destination** as the active model. A destination
 is the provider label **plus** the endpoint origin **plus** the resolved model's
@@ -307,6 +309,9 @@ re-installs the editor once.
      produce no suggestion) — the controller lazily imports `completeSimple`
      from the remapped legacy pi-ai module and calls
      `completeSimple(model, { systemPrompt: [prompt], messages }, { apiKey: modelRegistry.resolver(model), signal, reasoning })`.
+     The event's `messages` snapshot covers only the finished run, so the
+     transcript prepends the earlier conversation from the session (entries
+     older than the run's first message) before it.
      OMP emits the extension `agent_end` **before** the session fully unwinds
      (`ctx.isIdle()` is still false at handler time), so the terminal event
      itself is treated as the settle signal on OMP; Pi keeps its

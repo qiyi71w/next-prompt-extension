@@ -6213,6 +6213,133 @@ describe("Step 1 quality regressions (Q-series)", () => {
 		expect(sent).not.toContain("stale reply");
 	});
 
+	test("Q6b: OMP prepends the earlier conversation and keeps the run's own messages once", async () => {
+		const { fake } = await setupOmp({
+			branch: [
+				{ type: "message", message: { role: "user", content: "earlier request", timestamp: 1000 } },
+				{
+					type: "message",
+					message: {
+						role: "assistant",
+						content: [{ type: "text", text: "earlier reply" }],
+						stopReason: "stop",
+						timestamp: 2000,
+					},
+				},
+				// The session already recorded part of the finishing run.
+				{ type: "message", message: { role: "user", content: "current request", timestamp: 3000 } },
+				{
+					type: "message",
+					message: {
+						role: "assistant",
+						content: [{ type: "text", text: "partial step" }],
+						stopReason: "toolUse",
+						timestamp: 3500,
+					},
+				},
+			],
+		});
+		await fake.handlers.get("agent_end")!(
+			{
+				type: "agent_end",
+				messages: [
+					{ role: "user", content: "current request", timestamp: 3000 },
+					{
+						role: "assistant",
+						content: [{ type: "text", text: "final reply" }],
+						stopReason: "stop",
+						timestamp: 4000,
+					},
+				],
+			},
+			fake.ctx,
+		);
+		const sent = (fake.calls.ompComplete[0]!.messages[0] as {
+			content: Array<{ type: string; text?: string }>;
+		}).content[0]!.text!;
+		expect(sent).toBe(
+			[
+				"User: earlier request",
+				"Assistant: earlier reply",
+				"User: current request",
+				"Assistant: final reply",
+			].join("\n"),
+		);
+	});
+
+	test("Q6c: a user-invoked /skill: prompt becomes the invocation line, not the skill body", () => {
+		const skillMessage = {
+			type: "message",
+			message: {
+				role: "custom",
+				customType: "skill-prompt",
+				attribution: "user",
+				content: "[IMPORTANT: User invoked the skill] SKILL BODY TEXT",
+				details: { name: "diagnosing-bugs", args: " 先查问题2 " },
+			},
+		} as BranchEntry;
+		// Raw session-entry shape (getBranch fallback).
+		const storedSkill = {
+			type: "custom_message",
+			customType: "skill-prompt",
+			attribution: "user",
+			content: "SKILL BODY TEXT",
+			details: { name: "grilling" },
+		} as BranchEntry;
+		const collab = {
+			type: "message",
+			message: {
+				role: "custom",
+				customType: "collab-prompt",
+				attribution: "user",
+				content: "guest asks for tests",
+			},
+		} as BranchEntry;
+		const out = buildTranscript([
+			storedSkill,
+			assistantEntry("grilled"),
+			skillMessage,
+			assistantEntry("diagnosed"),
+			collab,
+		]);
+		expect(out).toBe(
+			[
+				"User: /skill:grilling",
+				"Assistant: grilled",
+				"User: /skill:diagnosing-bugs 先查问题2",
+				"Assistant: diagnosed",
+				"User: guest asks for tests",
+			].join("\n"),
+		);
+		expect(buildTranscript([storedSkill, skillMessage], { maxRecentTurns: 1 })).toBe(
+			"User: /skill:diagnosing-bugs 先查问题2",
+		);
+	});
+
+	test("Q6d: custom messages the user did not author stay out of the transcript", () => {
+		const notice = {
+			type: "message",
+			message: {
+				role: "custom",
+				customType: "xdev-mount-notice",
+				content: "<system-notice>tools changed</system-notice>",
+			},
+		} as BranchEntry;
+		const agentSkill = {
+			type: "message",
+			message: {
+				role: "custom",
+				customType: "skill-prompt",
+				attribution: "agent",
+				content: "autoloaded skill",
+				details: { name: "tdd" },
+			},
+		} as BranchEntry;
+		expect(buildTranscript([notice, agentSkill, assistantEntry("done")])).toBe(
+			"Assistant: done",
+		);
+	});
+
 	test("Q7: bounded redacted tool-outcome metadata is preserved in the transcript", () => {
 		// Raw toolResult shape with tool metadata; BranchEntry widening lands in Step 2.
 		const toolResult = {
