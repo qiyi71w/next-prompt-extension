@@ -1620,7 +1620,11 @@ export function shouldTrigger(
 
 const DIM_START = "\x1b[2m";
 const DIM_END = "\x1b[22m";
-const CURSOR_BLOCK_END = "\x1b[0m"; // ends the \x1b[7m... reverse-video cursor
+const CURSOR_BLOCK_END = "\x1b[0m"; // ends the \x1b[7m... reverse-video cursor (Pi < 1.4)
+// Pi >= 1.4 wraps the drawn cursor in these zero-width APC markers (pi-tui
+// FAKE_CURSOR_START/END, defined here because older pi-tui lacks the export).
+const FAKE_CURSOR_START = "\x1b_pi:fc\x07";
+const FAKE_CURSOR_END = "\x1b_pi:/fc\x07";
 
 /**
  * Skip the editor's cursor representation starting at `i` (the position just
@@ -1642,6 +1646,14 @@ function skipCursorRepresentation(line: string, i: number): number {
 				let k = j + 2;
 				while (k < n && (line.charCodeAt(k) < 0x40 || line.charCodeAt(k) > 0x7e)) k += 1;
 				j = Math.min(n, k + 1);
+				continue;
+			}
+			if (line[j + 1] === "_") {
+				// APC (e.g. Pi's fake-cursor markers): consume through BEL or ST.
+				const bel = line.indexOf("\x07", j + 2);
+				const st = line.indexOf("\x1b\\", j + 2);
+				const end = bel === -1 ? st : st === -1 ? bel : Math.min(bel, st);
+				j = end === -1 ? n : end + (end === bel ? 1 : 2);
 				continue;
 			}
 			j = Math.min(n, j + 2); // ESC + one byte
@@ -1710,26 +1722,42 @@ export function overlayGhost(
 	const line = result[cursorLineIdx]!;
 
 	// The cursor is: <before><CURSOR_MARKER><cursor block or glyph><rest>
-	// Locate the insertion point: Pi's reverse-video cursor block ends at the
-	// first \x1b[0m after the marker; OMP's plain theme glyph has no block, so
-	// skip one glyph after the marker instead.
+	// Locate the insertion point. Pi >= 1.4 wraps the drawn cursor in APC
+	// markers (`\x1b_pi:fc\x07…\x1b_pi:/fc\x07`) that the TUI resolves later;
+	// older Pi draws a reverse-video block ending at the first \x1b[0m; OMP's
+	// plain theme glyph has neither, so skip one glyph after the marker.
 	const markerIdx = line.indexOf(CURSOR_MARKER);
 	if (markerIdx === -1) return lines; // defensive (already checked)
-	const cursorBlockEnd = line.indexOf(
-		CURSOR_BLOCK_END,
-		markerIdx + CURSOR_MARKER.length,
-	);
+	const afterMarker = markerIdx + CURSOR_MARKER.length;
+	const fakeCursorEnd = line.startsWith(FAKE_CURSOR_START, afterMarker)
+		? line.indexOf(FAKE_CURSOR_END, afterMarker)
+		: -1;
+	const cursorBlockEnd =
+		fakeCursorEnd !== -1 ? -1 : line.indexOf(CURSOR_BLOCK_END, afterMarker);
 	const insertAt =
-		cursorBlockEnd !== -1
-			? cursorBlockEnd + CURSOR_BLOCK_END.length
-			: skipCursorRepresentation(line, markerIdx + CURSOR_MARKER.length);
+		fakeCursorEnd !== -1
+			? fakeCursorEnd + FAKE_CURSOR_END.length
+			: cursorBlockEnd !== -1
+				? cursorBlockEnd + CURSOR_BLOCK_END.length
+				: skipCursorRepresentation(line, afterMarker);
 
 	// Compute the visible width of the real content before the cursor (text +
 	// cursor glyph; ANSI and the marker stripped) so the ghost is sized to fit
-	// without overflowing the editor width.
+	// without overflowing the editor width. Only padding may be given to the
+	// ghost: text after the cursor (cursor at the start of a filled editor)
+	// keeps its cells, else the line overflows and Pi's TUI throws. Padding is
+	// plain spaces (`\s` also matches zero-width U+FEFF), taken from the line
+	// end first so a space the user typed right after the cursor survives.
 	const leftPart = line.slice(0, insertAt);
 	const leftVisible = visibleWidth(stripAnsi(leftPart));
-	const remaining = Math.max(0, contentWidth - leftVisible);
+	const rawTail = line.slice(insertAt);
+	const trailingPad = rawTail.match(/ +$/)?.[0].length ?? 0;
+	const leadingPad = trailingPad > 0 ? 0 : rawTail.match(/^ +/)?.[0].length ?? 0;
+	const slack = Math.max(0, contentWidth - visibleWidth(stripAnsi(line)));
+	const remaining = Math.max(
+		0,
+		Math.min(contentWidth - leftVisible, leadingPad + trailingPad + slack),
+	);
 
 	const ghostSlice =
 		visibleWidth(ghost) > remaining
@@ -1742,15 +1770,11 @@ export function overlayGhost(
 	// Preserve the line's exact width: remove ghostVisible cells from the
 	// padding adjacent to the cursor. Pi pads at the line end (`rest<pad>`);
 	// OMP pads right after the cursor, before the right border (`<pad>─╯`).
-	let tail = line.slice(insertAt);
-	const leadingPad = tail.match(/^\s+/)?.[0].length ?? 0;
-	if (leadingPad > 0) {
+	let tail = rawTail;
+	if (trailingPad > 0) {
+		tail = tail.slice(0, Math.max(0, tail.length - Math.min(trailingPad, ghostVisible)));
+	} else if (leadingPad > 0) {
 		tail = tail.slice(Math.min(leadingPad, ghostVisible));
-	} else {
-		const trailingPad = tail.match(/\s+$/)?.[0].length ?? 0;
-		if (trailingPad > 0) {
-			tail = tail.slice(0, Math.max(0, tail.length - Math.min(trailingPad, ghostVisible)));
-		}
 	}
 	result[cursorLineIdx] = leftPart + ghostStyled + tail;
 	return result;
@@ -1762,6 +1786,8 @@ function stripAnsi(s: string): string {
 	return s
 		.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "")
 		.replace(/\x1b[2-]m/g, "")
+		// APC strings: the cursor marker and Pi's fake-cursor markers.
+		.replace(/\x1b_[^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
 		.replace(CURSOR_MARKER, "");
 }
 
