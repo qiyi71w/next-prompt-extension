@@ -2352,6 +2352,8 @@ function makeOmpFake(opts: {
 		| undefined;
 	inputListeners: Array<(data: string) => { consume?: boolean } | undefined>;
 	deliverInput: (data: string) => void;
+	/** OMP `clearExtensionTerminalInputListeners`: drops every extension listener. */
+	clearHostInputListeners: () => void;
 	unsubInputCalls: number;
 	editor: import("@earendil-works/pi-tui").Editor;
 	calls: {
@@ -2573,6 +2575,10 @@ function makeOmpFake(opts: {
 				if (result?.consume) return;
 			}
 			editor.handleInput(data);
+		},
+		clearHostInputListeners: () => {
+			inputListeners.length = 0;
+			inputHandler = undefined;
 		},
 		get unsubInputCalls() {
 			return unsubInputCalls;
@@ -5315,6 +5321,32 @@ describe("host compatibility boundary", () => {
 		const { fake } = await setupOmp({ branch: [assistantEntry("a")] });
 		await fake.handlers.get("agent_end")!({}, fake.ctx);
 		expect(fake.calls.ompComplete).toHaveLength(1);
+	});
+
+	test("B8b: OMP /new keeps the accept key working (listener re-registered on session_switch)", async () => {
+		const { fake } = await setupOmp({
+			branch: [assistantEntry("a")],
+			completeSimpleResult: {
+				content: [{ type: "text", text: "after new" }],
+				stopReason: "stop",
+			},
+		});
+		// OMP 18 `/new`: prepareSessionSwitch clears every extension terminal
+		// listener, then AgentSession.newSession emits session_before_switch and
+		// session_switch(reason "new") — never session_start.
+		fake.clearHostInputListeners();
+		await fake.handlers.get("session_before_switch")?.(
+			{ type: "session_before_switch", reason: "new" },
+			fake.ctx,
+		);
+		await fake.handlers.get("session_switch")?.(
+			{ type: "session_switch", reason: "new" },
+			fake.ctx,
+		);
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(fake.widgetContent?.[0] ?? "").toContain("after new");
+		fake.deliverInput("\x1b/");
+		expect(fake.editorText).toBe("after new");
 	});
 
 	test("B9: unknown context (no mode, no hasUI) follows the conservative no-compute path", async () => {

@@ -2788,7 +2788,9 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		}
 	}
 
-	api.on("session_start", (_e, ctx) => {
+	// Per-session setup: config, suggestion state, ghost editor and the global
+	// accept-key listener.
+	function startSession(ctx: HostCtx): void {
 		reset();
 		ref.unsubInput?.();
 		ref.unsubInput = undefined;
@@ -2881,7 +2883,16 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 				void handleSettled(ctx, undefined, "manual");
 			}),
 		);
-	});
+	}
+
+	api.on("session_start", (_e, ctx) => startSession(ctx));
+	// OMP emits `session_switch` (reason new/resume/fork), never a fresh
+	// `session_start`, and `/new` first clears every extension terminal-input
+	// listener. Without this re-run the accept key stays dead for the rest of
+	// the process even though suggestions keep rendering.
+	if (host === "omp") {
+		api.on("session_switch", (_e, ctx) => startSession(ctx));
+	}
 
 	// Completion lifecycle by host:
 	//  - Pi: `agent_settled` is its fully-settled contract (fires once after
